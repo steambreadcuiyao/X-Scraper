@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Runtime data
+data/
+*.db
+*.log
+*.log.jsonl
+
+# Environment
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Screenshots / temp
+*.png
+*.jpg
+test_*.json
+scraper_child.py
+snap.yml
+
+# Playwright browsers
+.playwright-cli/
+_ui-review.md
