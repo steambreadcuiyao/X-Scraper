@@ -139,7 +139,7 @@ async def _make_browser(pw=None):
     if headless:
         args.append("--headless=new")
 
-    browser = await pw.chromium.launch(channel="chrome", headless=headless, args=args)
+    browser = await pw.chromium.launch(headless=headless, args=args)
     return pw, browser
 
 
