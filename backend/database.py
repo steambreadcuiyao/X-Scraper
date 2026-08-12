@@ -436,6 +436,7 @@ def task_create(name: str, scope_type: str = "account", scope_ids: list = None,
 def task_update(task_id: int, **kwargs):
     allowed = {"name", "scope_type", "scope_ids", "channel", "schedule_type",
                "cron_expr", "interval_minutes", "max_tweets_per_run", "status",
+               "credential_id",
                "last_run_at", "next_run_at", "progress_current", "progress_total",
                "error_message", "filters_json", "run_count"}
     updates = {}
@@ -683,6 +684,57 @@ def tweet_search(keyword: str = None, author: str = None,
     }
 
 
+def task_covered_account_ids(conn):
+    """Return set of account IDs covered by all active tasks (all scope types)."""
+    tasks = conn.execute(
+        "SELECT scope_type, scope_ids FROM scrape_tasks WHERE status='active'"
+    ).fetchall()
+    covered = set()
+    for t in tasks:
+        scope_type = t["scope_type"]
+        try:
+            scope_ids = json.loads(t["scope_ids"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(scope_ids, dict):
+            raw_ids = scope_ids.get("accounts", [])
+        else:
+            raw_ids = scope_ids
+        if not raw_ids:
+            continue
+        if scope_type == "account":
+            ids = conn.execute(
+                f"SELECT id FROM accounts WHERE id IN ({','.join('?'*len(raw_ids))}) AND status='active'",
+                raw_ids
+            ).fetchall()
+            covered.update(r["id"] for r in ids)
+        elif scope_type == "group":
+            ids = conn.execute(
+                f"SELECT id FROM accounts WHERE group_id IN ({','.join('?'*len(raw_ids))}) AND status='active'",
+                raw_ids
+            ).fetchall()
+            covered.update(r["id"] for r in ids)
+        elif scope_type == "tag":
+            for tag in raw_ids:
+                ids = conn.execute(
+                    "SELECT id FROM accounts WHERE tags LIKE ? AND status='active'",
+                    (f'%"{tag}"%',)
+                ).fetchall()
+                covered.update(r["id"] for r in ids)
+    return covered
+
+
+def task_covered_account_count(conn=None):
+    """Count unique accounts covered by all active tasks (all scope types)."""
+    own_conn = conn is None
+    if own_conn:
+        conn = get_conn()
+    count = len(task_covered_account_ids(conn))
+    if own_conn:
+        conn.close()
+    return count
+
+
 def tweet_stats():
     """Get overview statistics."""
     conn = get_conn()
@@ -692,6 +744,7 @@ def tweet_stats():
     stats["active_accounts"] = conn.execute(
         "SELECT COUNT(*) as c FROM accounts WHERE status='active'"
     ).fetchone()["c"]
+    stats["task_covered_accounts"] = task_covered_account_count(conn)
     stats["recent_count"] = conn.execute(
         "SELECT COUNT(*) as c FROM tweets WHERE scraped_at >= datetime('now','localtime','-24 hours')"
     ).fetchone()["c"]

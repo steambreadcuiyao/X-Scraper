@@ -83,7 +83,7 @@
 .mx-auto{margin-left:auto;margin-right:auto}
 .mb-1{margin-bottom:4px}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}
 .mb-4{margin-bottom:16px}.mb-6{margin-bottom:24px}
-.mt-0\.5{margin-top:2px}.mt-1{margin-top:4px}.mt-2{margin-top:8px}.mt-3{margin-top:12px}.mt-4{margin-top:16px}
+.mt-0\.5{margin-top:2px}.mt-1{margin-top:4px}.mt-2{margin-top:8px}.mt-3{margin-top:12px}.mt-4{margin-top:16px}.mt-6{margin-top:24px}
 .mr-0\.5{margin-right:2px}.mr-1{margin-right:4px}.mr-1\.5{margin-right:6px}.mr-2{margin-right:8px}.mr-auto{margin-right:auto}
 .-mt-2{margin-top:-8px}
 
@@ -224,9 +224,10 @@
 
     <!-- ===== 仪表盘 ===== -->
     <div v-if="activeTab==='dashboard'">
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+      <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
         <div class="card"><p class="text-xs text-gray-500 mb-1">总推文数</p><p class="text-2xl font-semibold text-gray-900">{{ stats.total_tweets||0 }}</p></div>
         <div class="card"><p class="text-xs text-gray-500 mb-1">监控账号</p><p class="text-2xl font-semibold text-gray-900">{{ stats.active_accounts||0 }} / {{ stats.total_accounts||0 }}</p></div>
+        <div class="card"><p class="text-xs text-gray-500 mb-1">采集覆盖账号</p><p class="text-2xl font-semibold text-blue-600">{{ stats.task_covered_accounts||0 }} / {{ stats.total_accounts||0 }}</p></div>
         <div class="card"><p class="text-xs text-gray-500 mb-1">24h新增</p><p class="text-2xl font-semibold text-green-600">{{ stats.recent_count||0 }}</p></div>
         <div class="card"><p class="text-xs text-gray-500 mb-1">最新采集</p><p class="text-sm font-medium text-gray-700 mt-0.5">{{ stats.latest_scrape||'暂无' }}</p></div>
       </div>
@@ -248,6 +249,32 @@
           </div>
         </div>
         <div v-else class="empty-state" style="padding:32px 24px"><i class="ri-inbox-line" style="font-size:32px"></i><p>暂无采集数据，创建任务并执行后查看</p></div>
+      </div>
+      <div class="card mt-6">
+        <h3 class="text-sm font-medium text-gray-700 mb-3">未被采集任务覆盖的账号 <span class="text-xs text-gray-400 ml-1">({{ uncovered.total||0 }} 个)</span></h3>
+        <div v-if="uncovered.total>0">
+          <table class="w-full text-sm">
+            <thead><tr class="text-left text-xs text-gray-500 border-b">
+              <th class="pb-2 pr-2">账号</th><th class="pb-2 pr-2">分组</th><th class="pb-2 pr-2">标签</th><th class="pb-2">加入日期</th>
+            </tr></thead>
+            <tbody>
+              <tr v-for="a in uncovered.items" :key="a.id" class="border-b border-gray-100">
+                <td class="py-2 pr-2"><span class="font-medium text-gray-800">@{{ a.username }}</span><span class="text-gray-400 ml-1" v-if="a.display_name&&a.display_name!==a.username">{{ a.display_name }}</span></td>
+                <td class="py-2 pr-2"><span class="badge" :style="{background:getGroupColor(a.group_name),color:'#fff'}">{{ a.group_name }}</span></td>
+                <td class="py-2 pr-2"><span v-for="t in a.tags" class="badge badge-gray mr-1">{{ t }}</span><span v-if="!a.tags||!a.tags.length" class="text-gray-400">—</span></td>
+                <td class="py-2 text-gray-500">{{ a.created_at ? a.created_at.slice(0,10) : '' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="flex items-center justify-between mt-3 pt-2 border-t border-gray-100">
+            <span class="text-xs text-gray-400">第 {{ uncovered.page }} / {{ uncoveredTotalPages() }} 页</span>
+            <div class="flex gap-1">
+              <button @click="loadUncovered(uncovered.page-1)" :disabled="uncovered.page<=1" class="px-2 py-1 text-xs rounded border border-gray-200 disabled:opacity-30">上一页</button>
+              <button @click="loadUncovered(uncovered.page+1)" :disabled="uncovered.page>=uncoveredTotalPages()" class="px-2 py-1 text-xs rounded border border-gray-200 disabled:opacity-30">下一页</button>
+            </div>
+          </div>
+        </div>
+        <div v-else class="empty-state" style="padding:24px"><p class="text-sm text-green-600">全部 {{ stats.total_accounts||0 }} 个账号已被采集任务覆盖 ✓</p></div>
       </div>
     </div>
 
@@ -663,6 +690,10 @@ createApp({setup(){
   const loadStats=async()=>{const r=await fetch(API+'/stats');stats.value=await r.json()};
   const trend=ref({});
   const loadTrend=async()=>{try{const r=await fetch(API+'/stats/trend');trend.value=await r.json()}catch{}};
+  const uncovered=reactive({total:0,page:1,page_size:10,items:[]});
+  const loadUncovered=async(p=1)=>{try{const r=await fetch(API+'/stats/uncovered-accounts?page='+p+'&page_size=10');const d=await r.json();uncovered.total=d.total;uncovered.page=d.page;uncovered.page_size=d.page_size;uncovered.items=d.items}catch{}};
+  const uncoveredTotalPages=()=>{const s=uncovered.page_size||1;return Math.max(1,Math.ceil(uncovered.total/s))};
+  const getGroupColor=n=>{const g=groups.value.find(x=>x.name===n);return g?g.color:'#9ca3af'};
   const loadCreds=async()=>{const r=await fetch(API+'/credentials');credentials.value=await r.json()};
   const doLogin=async()=>{loginLoading.value=true;const r=await fetch(API+'/credentials/login',{method:'POST'});const d=await r.json();loginLoading.value=false;if(d.ok)st('浏览器已打开，请在 Chrome 窗口中完成 X 登录',"success");else st(d.error||'登录失败',"error")};
   const loadGroups=async()=>{const r=await fetch(API+'/groups');groups.value=await r.json()};
@@ -743,14 +774,14 @@ createApp({setup(){
 
   const connectWS=()=>{}; // WebSocket disabled — not compatible with embedded browser
 
-  onMounted(async()=>{await Promise.all([loadStats(),loadCreds(),loadGroups(),loadAccounts(),loadAllAccounts(),loadTasks()]);connectWS();
+  onMounted(async()=>{await Promise.all([loadStats(),loadCreds(),loadGroups(),loadAccounts(),loadAllAccounts(),loadTasks()]);loadUncovered();connectWS();
     // Poll tasks every 3 seconds when any task is running
     setInterval(()=>{if(tasks.value.some(t=>t.status==='running'))loadTasks()},3000)
   });
   watch(activeTab,t=>{if(t==='logs')loadLogs()});
-  watch(activeTab,t=>{if(t==='dashboard'){loadStats();loadTrend()}if(t==='accounts'){loadAccounts();loadAllAccounts()}if(t==='tasks')loadTasks();if(t==='credentials')loadCreds()});
+  watch(activeTab,t=>{if(t==='dashboard'){loadStats();loadTrend();loadUncovered()}if(t==='accounts'){loadAccounts();loadAllAccounts()}if(t==='tasks')loadTasks();if(t==='credentials')loadCreds()});
 
-  return{activeTab,tabs,wsConnected,stats,trend,credentials,loginLoading,doLogin,credForm,showCredModal,validateCred,saveCred,deleteCred,groups,groupForm,showGroupModal,saveGroup,deleteGroup,accounts,allAccounts,accForm,showAccModal,acctFilter,showBatchImport,batchUsernames,batchGroupId,parseTags,saveAccount,editAccount,toggleAccount,deleteAccount,doBatchImport,loadAccounts,loadAllAccounts,tasks,taskForm,showTaskModal,loadTasks,openTaskRuns,loadTaskRuns,scheduleLabel,statusLabel,saveTask,editTask,runTask,toggleTask,deleteTask,tweetTypeOptions,typeBadge,tweetTypeLabel,sp,sr,selected,doSearch,toggleSelect,isAllSelected,toggleAll,fm,parseMedia,exportCSV,st,toasts,dismissToast,logFilter,logItems,logTotal,loadLogs};
+  return{activeTab,tabs,wsConnected,stats,trend,uncovered,loadUncovered,uncoveredTotalPages,getGroupColor,credentials,loginLoading,doLogin,credForm,showCredModal,validateCred,saveCred,deleteCred,groups,groupForm,showGroupModal,saveGroup,deleteGroup,accounts,allAccounts,accForm,showAccModal,acctFilter,showBatchImport,batchUsernames,batchGroupId,parseTags,saveAccount,editAccount,toggleAccount,deleteAccount,doBatchImport,loadAccounts,loadAllAccounts,tasks,taskForm,showTaskModal,loadTasks,openTaskRuns,loadTaskRuns,scheduleLabel,statusLabel,saveTask,editTask,runTask,toggleTask,deleteTask,tweetTypeOptions,typeBadge,tweetTypeLabel,sp,sr,selected,doSearch,toggleSelect,isAllSelected,toggleAll,fm,parseMedia,exportCSV,st,toasts,dismissToast,logFilter,logItems,logTotal,loadLogs};
 }}).mount('#app');
 </script>
 </body>

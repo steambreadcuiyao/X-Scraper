@@ -6,6 +6,7 @@ REST API + WebSocket + Background task scheduler.
 import json
 import logging
 import asyncio
+import random
 import sys
 
 # On Windows, Playwright requires ProactorEventLoop for subprocess support.
@@ -481,6 +482,62 @@ def api_stats_trend():
         GROUP BY d ORDER BY d
     """).fetchall()
     conn.close()
+
+
+@app.get("/api/stats/uncovered-accounts")
+def api_uncovered_accounts(page: int = 1, page_size: int = 10):
+    """List accounts NOT covered by any active collection task."""
+    from database import get_conn, task_covered_account_ids
+    import json
+    conn = get_conn()
+    covered_ids = task_covered_account_ids(conn)
+    if covered_ids:
+        placeholders = ",".join("?" * len(covered_ids))
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM accounts WHERE status='active' AND id NOT IN ({placeholders})",
+            list(covered_ids)
+        ).fetchone()[0]
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            f"""SELECT a.*, g.name as group_name
+                FROM accounts a
+                LEFT JOIN account_groups g ON a.group_id = g.id
+                WHERE a.status='active' AND a.id NOT IN ({placeholders})
+                ORDER BY a.created_at DESC
+                LIMIT ? OFFSET ?""",
+            list(covered_ids) + [page_size, offset]
+        ).fetchall()
+    else:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM accounts WHERE status='active'"
+        ).fetchone()[0]
+        offset = (page - 1) * page_size
+        rows = conn.execute(
+            """SELECT a.*, g.name as group_name
+                FROM accounts a
+                LEFT JOIN account_groups g ON a.group_id = g.id
+                WHERE a.status='active'
+                ORDER BY a.created_at DESC
+                LIMIT ? OFFSET ?""",
+            (page_size, offset)
+        ).fetchall()
+    conn.close()
+    items = []
+    for r in rows:
+        tags = r["tags"]
+        try:
+            tags = json.loads(tags) if tags else []
+        except (json.JSONDecodeError, TypeError):
+            tags = []
+        items.append({
+            "id": r["id"],
+            "username": r["username"],
+            "display_name": r["display_name"],
+            "group_name": r["group_name"] or "未分组",
+            "tags": tags,
+            "created_at": r["created_at"],
+        })
+    return {"total": total, "page": page, "page_size": page_size, "items": items}
     dates = [r['d'] for r in rows]
     counts = [r['cnt'] for r in rows]
     return {"dates": dates, "counts": counts}
@@ -515,7 +572,8 @@ def _schedule_task(task: dict):
         scheduler.add_job(
             _execute_task, "interval", minutes=task["interval_minutes"],
             args=[task["id"]], id=job_id, replace_existing=True,
-            max_instances=1, start_date=start_date,
+            max_instances=1, coalesce=True, misfire_grace_time=3600,
+            start_date=start_date,
         )
         # Update next_run_at for display
         job = scheduler.get_job(job_id)
@@ -583,10 +641,14 @@ async def _execute_task(task_id: int):
         import traceback
         logger.error(f"任务 #{task_id} 异常崩溃: {e}", exc_info=True)
         try:
-            task_update(task_id, status="active", error_message=str(e)[:200])
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            tasks = task_list()
+            task = next((t for t in tasks if t["id"] == task_id), None)
+            new_status = "completed" if (task and task["schedule_type"] == "manual") else "active"
+            task_update(task_id, status=new_status, last_run_at=now,
+                        error_message=str(e)[:200])
         except Exception:
             pass
-
 
         # Also mark the current run as failed
         try:
@@ -595,6 +657,15 @@ async def _execute_task(task_id: int):
             conn.execute("UPDATE task_runs SET status='failed', finished_at=datetime('now','localtime'), error_message=? WHERE task_id=? AND status='running'", (f"{type(e).__name__}: {str(e)[:200]}", task_id))
             conn.commit()
             conn.close()
+        except Exception:
+            pass
+
+        # Re-schedule to prevent scheduler freeze after crash
+        try:
+            tasks = task_list()
+            task = next((t for t in tasks if t["id"] == task_id), None)
+            if task and task["schedule_type"] != "manual":
+                _schedule_task(task)
         except Exception:
             pass
 
@@ -632,16 +703,19 @@ async def _execute_task_inner(task_id: int):
     ctx = None
     browser = None
     page = None
+    pw = None
     try:
-        from scraper.playwright_scraper import _make_browser, _make_context, fetch_timeline_with_page
+        from scraper.playwright_scraper import _make_browser, _make_context, fetch_timeline_with_page, BROWSER_MODE as _bm
 
-        pw = _shared_pw
-        if not pw:
-            raise RuntimeError("Playwright driver 未初始化")
-
-        _, browser = await _make_browser(pw)
+        if _bm == "cdp":
+            # CDP mode: fresh driver per run (shared singleton is unreliable for CDP connections)
+            pw, browser = await _make_browser()
+        else:
+            pw = _shared_pw
+            if not pw:
+                raise RuntimeError("Playwright driver 未初始化")
+            _, browser = await _make_browser(pw)
         ctx = await _make_context(browser, cookies_json, proxy)
-        page = await ctx.new_page()
         page = await ctx.new_page()
 
         for i, acc in enumerate(accounts):
@@ -662,7 +736,7 @@ async def _execute_task_inner(task_id: int):
                     break
                 except Exception as e:
                     err_str = str(e)
-                    if retry < 2 and any(kw in err_str for kw in ("ERR_NAME_NOT_RESOLVED","ERR_NETWORK_CHANGED","ERR_CONNECTION","Connection closed","Target closed")):
+                    if retry < 2 and any(kw in err_str for kw in ("ERR_NAME_NOT_RESOLVED","ERR_NETWORK_CHANGED","ERR_CONNECTION","Connection closed","Target closed","Page crashed")):
                         retry += 1
                         logger.warning(f"@{acc['username']}: retry {retry}/2: {err_str[:60]}")
                         if page: await page.close()
@@ -674,13 +748,26 @@ async def _execute_task_inner(task_id: int):
                         all_errors.append(f"@{acc['username']}: {err_str}")
                         logger.error(f"@{acc['username']}: 失败: {err_str[:200]}")
                         break
+            # Fresh page per account + human-like delay to avoid X rate-limit / page crashes
+            try:
+                if page: await page.close()
+            except Exception:
+                pass
+            page = await ctx.new_page()
+            await asyncio.sleep(2 + random.random() * 3)
             task_update(task_id, progress_current=i + 1)
     finally:
-        for obj in [page, ctx, browser]:
+        from scraper.playwright_scraper import BROWSER_MODE as _bm
+        # CDP mode: only close the page; NEVER close user's real context/browser
+        objs = [page] if _bm == "cdp" else [page, ctx, browser]
+        for obj in objs:
             if obj:
                 try: await obj.close()
                 except Exception: pass
-        # Do NOT stop pw — it's the global singleton
+        # CDP mode: stop the per-run driver (fresh one). Otherwise keep global singleton.
+        if _bm == "cdp" and pw:
+            try: await pw.stop()
+            except Exception: pass
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # Save all errors (no truncation)
@@ -698,6 +785,11 @@ async def _execute_task_inner(task_id: int):
     if task["schedule_type"] == "interval" and task.get("interval_minutes"):
         next_dt = datetime.now() + timedelta(minutes=task["interval_minutes"])
         task_update(task_id, next_run_at=next_dt.strftime("%Y-%m-%d %H:%M:%S"))
+    # Re-schedule to ensure APScheduler job stays fresh (prevents scheduler freeze)
+    if task["schedule_type"] != "manual":
+        updated_task = next((t for t in task_list() if t["id"] == task_id), None)
+        if updated_task:
+            _schedule_task(updated_task)
 
     logger.info(f"任务执行完成: #{task_id} {task['name']}, 成功{accounts_success}/{total}账户, 新增{new_total}条, 错误{len([e for e in all_errors if e])}个")
     LogContext.clear()

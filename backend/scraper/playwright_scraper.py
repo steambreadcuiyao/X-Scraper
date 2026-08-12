@@ -145,6 +145,13 @@ async def _make_browser(pw=None):
 
 async def _make_context(browser, cookies_json: Optional[str] = None, proxy: Optional[str] = None):
     """Create browser context with cookies and anti-detection."""
+    if BROWSER_MODE == "cdp":
+        # CDP mode: reuse the real Chrome's existing context (already logged in).
+        # browser.new_context() is not supported on CDP connections.
+        contexts = browser.contexts
+        context = contexts[0] if contexts else await browser.new_context()
+        return context
+
     context = await browser.new_context(
         user_agent=random.choice(USER_AGENTS),
         viewport=random.choice(VIEWPORTS),
@@ -163,7 +170,7 @@ async def _make_context(browser, cookies_json: Optional[str] = None, proxy: Opti
             cookie_list = cookies if isinstance(cookies, list) else cookies.get("cookies", [])
             if cookie_list:
                 page = await context.new_page()
-                await page.goto("https://x.com/", wait_until="commit", timeout=10000)
+                await page.goto("https://x.com/", wait_until="commit", timeout=20000)
                 await context.add_cookies(cookie_list)
                 await page.close()
                 logger.info(f"Injected {len(cookie_list)} cookies")
@@ -254,7 +261,7 @@ async def fetch_user_timeline(username: str, max_tweets: int = 5,
             return []
 
         try:
-            await page.wait_for_selector('[data-testid="tweet"]', timeout=15000)
+            await page.wait_for_selector('article[data-tweet-id]', timeout=30000)
         except Exception:
             logger.warning(f"@{username}: 未找到推文")
             return []
@@ -266,7 +273,7 @@ async def fetch_user_timeline(username: str, max_tweets: int = 5,
         no_new_count = 0
 
         while len(tweets) < max_tweets and scroll_attempts < max_scrolls and not hit_boundary:
-            articles = await page.query_selector_all('[data-testid="tweet"]')
+            articles = await page.query_selector_all('article[data-tweet-id]')
             new_found = 0
 
             for article in articles:
@@ -351,7 +358,7 @@ async def fetch_timeline_with_page(page, username: str, max_tweets: int = 5,
         return []
 
     try:
-        await page.wait_for_selector('[data-testid="tweet"]', timeout=15000)
+        await page.wait_for_selector('article[data-tweet-id]', timeout=30000)
     except Exception:
         logger.warning(f"@{username}: 未找到推文")
         return []
@@ -363,7 +370,7 @@ async def fetch_timeline_with_page(page, username: str, max_tweets: int = 5,
     no_new_count = 0
 
     while len(tweets) < max_tweets and scroll_attempts < max_scrolls and not hit_boundary:
-        articles = await page.query_selector_all('[data-testid="tweet"]')
+        articles = await page.query_selector_all('article[data-tweet-id]')
         new_found = 0
         for article in articles:
             try:
@@ -411,13 +418,20 @@ async def _extract_tweet(article, username: str) -> Optional[dict]:
         tweet_id = m.group(1)
 
         text = ""
-        text_el = await article.query_selector('[data-testid="tweetText"]')
+        text_el = await article.query_selector('meta[itemprop="text"]')
         if text_el:
-            spans = await text_el.query_selector_all('span')
-            text = "".join([(await s.inner_text() or "") for s in spans]) if spans else (await text_el.inner_text() or "")
+            text = (await text_el.get_attribute("content")) or ""
+        if not text:
+            text_el2 = await article.query_selector('[data-testid="tweetText"]')
+            if text_el2:
+                spans = await text_el2.query_selector_all('span')
+                text = "".join([(await s.inner_text() or "") for s in spans]) if spans else (await text_el2.inner_text() or "")
 
         time_el = await article.query_selector("time")
         created_at = await time_el.get_attribute("datetime") if time_el else None
+        if not created_at:
+            meta_date = await article.query_selector('meta[itemprop="dateCreated"]')
+            created_at = (await meta_date.get_attribute("content")) if meta_date else None
 
         likes = await _parse_stat(article, "like")
         retweets = (await _parse_stat(article, "retweet")) or (await _parse_stat(article, "repost"))
