@@ -261,7 +261,7 @@ async def fetch_user_timeline(username: str, max_tweets: int = 5,
             return []
 
         try:
-            await page.wait_for_selector('article[data-tweet-id]', timeout=30000)
+            await page.wait_for_selector('article[itemid]', timeout=30000)
         except Exception:
             logger.warning(f"@{username}: 未找到推文")
             return []
@@ -273,7 +273,7 @@ async def fetch_user_timeline(username: str, max_tweets: int = 5,
         no_new_count = 0
 
         while len(tweets) < max_tweets and scroll_attempts < max_scrolls and not hit_boundary:
-            articles = await page.query_selector_all('article[data-tweet-id]')
+            articles = await page.query_selector_all('article[itemid]')
             new_found = 0
 
             for article in articles:
@@ -358,7 +358,7 @@ async def fetch_timeline_with_page(page, username: str, max_tweets: int = 5,
         return []
 
     try:
-        await page.wait_for_selector('article[data-tweet-id]', timeout=30000)
+        await page.wait_for_selector('article[itemid]', timeout=30000)
     except Exception:
         logger.warning(f"@{username}: 未找到推文")
         return []
@@ -370,7 +370,7 @@ async def fetch_timeline_with_page(page, username: str, max_tweets: int = 5,
     no_new_count = 0
 
     while len(tweets) < max_tweets and scroll_attempts < max_scrolls and not hit_boundary:
-        articles = await page.query_selector_all('article[data-tweet-id]')
+        articles = await page.query_selector_all('article[itemid]')
         new_found = 0
         for article in articles:
             try:
