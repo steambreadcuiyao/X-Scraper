@@ -3,7 +3,7 @@ X/Twitter scraper via Playwright async API + system Chrome.
 All Playwright interactions use async/await to coexist with FastAPI's event loop.
 """
 import json, logging, re, time, random, os, asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 try:
@@ -139,7 +139,9 @@ async def _make_browser(pw=None):
     if headless:
         args.append("--headless=new")
 
-    browser = await pw.chromium.launch(headless=headless, args=args)
+    # 2026-09-12: X 风控按浏览器指纹 403 封杀 Playwright 内置 Chromium（Client Hints 品牌为
+    # "Chromium" 而非 "Google Chrome"），系统真实 Chrome 不受影响。统一改用系统 Chrome 启动。
+    browser = await pw.chromium.launch(headless=headless, args=args, channel="chrome")
     return pw, browser
 
 
@@ -152,8 +154,7 @@ async def _make_context(browser, cookies_json: Optional[str] = None, proxy: Opti
         context = contexts[0] if contexts else await browser.new_context()
         return context
 
-    context = await browser.new_context(
-        user_agent=random.choice(USER_AGENTS),
+    ctx_kwargs = dict(
         viewport=random.choice(VIEWPORTS),
         locale="en-US",
         timezone_id="America/New_York",
@@ -162,6 +163,14 @@ async def _make_context(browser, cookies_json: Optional[str] = None, proxy: Opti
         color_scheme="light",
         proxy={"server": proxy} if proxy else None,
     )
+    # 2026-09-12: 无头模式系统 Chrome 原生 UA 带 "HeadlessChrome"，X 风控直接 403，
+    # 必须覆盖为与浏览器版本一致的正常 Chrome UA；可视模式用原生 UA 即可。
+    if BROWSER_MODE != "chrome-visible":
+        ctx_kwargs["user_agent"] = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+        )
+    context = await browser.new_context(**ctx_kwargs)
     await context.add_init_script(ANTI_DETECT_SCRIPT)
 
     if cookies_json:
@@ -261,7 +270,7 @@ async def fetch_user_timeline(username: str, max_tweets: int = 5,
             return []
 
         try:
-            await page.wait_for_selector('article[itemid]', timeout=30000)
+            await page.wait_for_selector('article', timeout=30000)
         except Exception:
             logger.warning(f"@{username}: 未找到推文")
             return []
@@ -273,7 +282,7 @@ async def fetch_user_timeline(username: str, max_tweets: int = 5,
         no_new_count = 0
 
         while len(tweets) < max_tweets and scroll_attempts < max_scrolls and not hit_boundary:
-            articles = await page.query_selector_all('article[itemid]')
+            articles = await page.query_selector_all('article')
             new_found = 0
 
             for article in articles:
@@ -358,7 +367,7 @@ async def fetch_timeline_with_page(page, username: str, max_tweets: int = 5,
         return []
 
     try:
-        await page.wait_for_selector('article[itemid]', timeout=30000)
+        await page.wait_for_selector('article', timeout=30000)
     except Exception:
         logger.warning(f"@{username}: 未找到推文")
         return []
@@ -370,7 +379,7 @@ async def fetch_timeline_with_page(page, username: str, max_tweets: int = 5,
     no_new_count = 0
 
     while len(tweets) < max_tweets and scroll_attempts < max_scrolls and not hit_boundary:
-        articles = await page.query_selector_all('article[itemid]')
+        articles = await page.query_selector_all('article')
         new_found = 0
         for article in articles:
             try:
@@ -426,12 +435,25 @@ async def _extract_tweet(article, username: str) -> Optional[dict]:
             if text_el2:
                 spans = await text_el2.query_selector_all('span')
                 text = "".join([(await s.inner_text() or "") for s in spans]) if spans else (await text_el2.inner_text() or "")
+        if not text:
+            # 新版 X (2026-09): 无 itemprop/data-testid, 文本在 div[dir="auto"] 的 span 中
+            for sel in ['div[dir="auto"] span', 'div[dir="auto"]']:
+                els = await article.query_selector_all(sel)
+                for el in els:
+                    t = (await el.inner_text() or "").strip()
+                    if len(t) > len(text):
+                        text = t
 
         time_el = await article.query_selector("time")
         created_at = await time_el.get_attribute("datetime") if time_el else None
         if not created_at:
             meta_date = await article.query_selector('meta[itemprop="dateCreated"]')
             created_at = (await meta_date.get_attribute("content")) if meta_date else None
+        if not created_at:
+            # 新版 X: 无 time 元素, 时间以相对文本显示 ("35s"/"1m"/"2h"), 换算为 UTC
+            rel = await _parse_relative_time(article)
+            if rel:
+                created_at = rel
 
         likes = await _parse_stat(article, "like")
         retweets = (await _parse_stat(article, "retweet")) or (await _parse_stat(article, "repost"))
@@ -450,6 +472,12 @@ async def _extract_tweet(article, username: str) -> Optional[dict]:
             src = await vid.get_attribute("src") or await vid.get_attribute("poster") or ""
             if src:
                 media_urls.append(src)
+        if not media_urls:
+            # 新版 X: 无 tweetPhoto, 卡片图在 a[href*="t.co"] img / pbs.twimg.com card_img
+            for img in await article.query_selector_all('img[src*="pbs.twimg.com"]'):
+                src = await img.get_attribute("src") or ""
+                if src and "profile_images" not in src.lower() and "profile_imgs" not in src.lower():
+                    media_urls.append(src)
 
         tweet_type = await _detect_tweet_type(article)
 
@@ -552,7 +580,41 @@ def _check_filters(tweet: dict, filters: dict) -> bool:
     return False
 
 
+async def _parse_relative_time(article) -> Optional[str]:
+    """新版 X: 无 time 元素, 推文时间以相对文本显示 ("35s"/"1m"/"2h"/"1d")。
+    从状态链接的文本中解析并换算为 UTC ISO 时间。"""
+    try:
+        link = await article.query_selector('a[href*="/status/"]')
+        if not link:
+            return None
+        rel = (await link.inner_text() or "").strip()
+        m = re.match(r'^(\d+)\s*([smhdw])$', rel.lower())
+        if not m:
+            return None
+        val = int(m.group(1))
+        unit = m.group(2)
+        seconds = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}.get(unit)
+        if not seconds:
+            return None
+        created = datetime.now(timezone.utc) - timedelta(seconds=val * seconds)
+        return created.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
 async def _parse_stat(article, stat_type: str) -> int:
+    # 新版 X (2026-09): 无 data-testid, 互动数在 aria-label 按钮的 [data-animated-count-visual] 内
+    label_map = {"like": "Like", "retweet": "Repost", "repost": "Repost", "reply": "Reply", "view": "View count"}
+    if stat_type in label_map:
+        btn = await article.query_selector(f'[aria-label="{label_map[stat_type]}"]')
+        if btn:
+            count_el = await btn.query_selector('[data-animated-count-visual]')
+            if count_el:
+                txt = (await count_el.inner_text() or "").strip()
+                num = _parse_count_text(txt)
+                if num is not None:
+                    return num
+    # 旧版 X: data-testid + aria-label 数字
     selector = f'[data-testid="{stat_type}"]'
     for el in await article.query_selector_all(selector):
         label = await el.get_attribute("aria-label") or ""
@@ -560,6 +622,20 @@ async def _parse_stat(article, stat_type: str) -> int:
         if nums:
             return int(nums[-1].replace(",", ""))
     return 0
+
+
+def _parse_count_text(txt: str) -> Optional[int]:
+    """解析新版互动数文本: "1万"->10000, "2633.8万"->26338000, "7253"->7253, "1"->1, 空->0"""
+    txt = (txt or "").strip().lower().replace(",", "")
+    if not txt:
+        return 0
+    m = re.match(r'^([\d.]+)\s*(万|亿|k|m|b)?$', txt)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2)
+    mult = {"万": 10000, "亿": 100000000, "k": 1000, "m": 1000000, "b": 1000000000}.get(unit, 1)
+    return int(val * mult)
 
 
 async def launch_x_login(proxy: Optional[str] = None) -> dict:
